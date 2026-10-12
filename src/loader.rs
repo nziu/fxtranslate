@@ -67,8 +67,24 @@ pub fn load_engine(
 }
 
 /// Build an [`Engine`] from resolved [`ModelFiles`] (model + the two vocab paths).
+/// The `mmap` feature (on under `fast`) maps the int8 weights instead of reading
+/// them into the heap; the embedder wants that even though upstream defaults to
+/// [`Engine::load`].
+///
+/// Invariant: under `mmap` the returned engine keeps the model file mapped for its
+/// whole lifetime, so the cache must never evict or delete a model that has been
+/// loaded — a deleted/unmapped file faults on access, and on Windows a mapped file
+/// can't be deleted at all. Upstream [`Engine::load`] reads into the heap and is
+/// immune to this.
 fn engine_from(files: &ModelFiles) -> Result<Engine, String> {
-    Engine::load(&files.model, &files.src_vocab, &files.trg_vocab)
+    #[cfg(feature = "mmap")]
+    {
+        Engine::load_mmapped(&files.model, &files.src_vocab, &files.trg_vocab)
+    }
+    #[cfg(not(feature = "mmap"))]
+    {
+        Engine::load(&files.model, &files.src_vocab, &files.trg_vocab)
+    }
 }
 
 /// Discover, download+cache (verified), and build a ready [`Translation`] for
@@ -116,7 +132,7 @@ pub fn load_translation(
 /// wins; otherwise a pivot through the hub ([`PREFERRED_HUB`]) works when both legs are
 /// already cached (the routing every Firefox pair uses). Errs when nothing usable is on
 /// disk, so the caller can report that alongside the discovery failure.
-fn load_cached_translation(cache: &Cache, src: &str, trg: &str) -> Result<Translation, String> {
+pub fn load_cached_translation(cache: &Cache, src: &str, trg: &str) -> Result<Translation, String> {
     if let Some(files) = cache.cached_model(src, trg) {
         return Ok(Translation::Direct(engine_from(&files)?));
     }
