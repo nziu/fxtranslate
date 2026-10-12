@@ -296,7 +296,7 @@ impl SpmVocab {
     /// Decode token ids back to text: concatenate pieces, turn `▁` into spaces,
     /// strip the leading space, and skip control/unknown pieces.
     pub fn decode(&self, ids: &[u32]) -> String {
-        let mut out = String::new();
+        let mut out = Vec::new();
         for &id in ids {
             let t = self
                 .types
@@ -306,21 +306,36 @@ impl SpmVocab {
             if t == PieceType::Control || t == PieceType::Unknown {
                 continue;
             }
-            out.push_str(self.piece(id));
+            // Byte-fallback pieces (`<0xNN>`) stand for one raw byte, like SentencePiece's decoder.
+            if t == PieceType::Byte {
+                if let Some(b) = parse_byte_piece(self.piece(id)) {
+                    out.push(b);
+                    continue;
+                }
+            }
+            out.extend_from_slice(self.piece(id).as_bytes());
         }
-        out.replace(SPACE, " ").trim_start().to_string()
+        String::from_utf8_lossy(&out).replace(SPACE, " ").trim_start().to_string()
     }
 
     /// Like [`decode`](Self::decode), but also returns each input id's byte range
-    /// in the returned string. The string is byte-identical to `decode`. Control
-    /// and unknown pieces contribute no text, so their range is empty (a
-    /// zero-length span at the position they would have occupied) — this keeps the
-    /// returned vector aligned one-to-one with `ids`, so a caller can index it by
-    /// target-token position (e.g. to attach an alignment row to a target token).
+    /// in the returned string. Control and unknown pieces contribute no text, so
+    /// their range is empty (a zero-length span at the position they would have
+    /// occupied) — this keeps the returned vector aligned one-to-one with `ids`,
+    /// so a caller can index it by target-token position (e.g. to attach an
+    /// alignment row to a target token).
     ///
     /// The `▁`→space rewrite and the leading-space trim are applied consistently:
     /// a piece's range covers exactly the bytes it produced in the final string,
     /// so the ranges tile the output in order.
+    ///
+    /// Unlike [`decode`](Self::decode), byte-fallback pieces (`<0xNN>`) are
+    /// emitted literally rather than folded into their raw byte. A single id can
+    /// then cover a partial UTF-8 character, and a `Range` landing mid-character
+    /// can't be sliced safely, so the two methods are byte-identical only for
+    /// inputs without byte pieces (pinned by
+    /// `decode_with_offsets_keeps_byte_pieces_literal`). Only `translate_aligned`
+    /// uses this; callers that want decoded text should use `decode`.
     pub fn decode_with_offsets(&self, ids: &[u32]) -> (String, Vec<Range<usize>>) {
         // Build the raw concatenation and each id's byte range within it.
         let mut raw = String::new();
@@ -721,6 +736,51 @@ mod tests {
         assert_eq!(&text[ranges[3].clone()], " world");
         // Ranges tile the output contiguously in order.
         assert_eq!(ranges[3].end, text.len());
+    }
+
+    #[test]
+    fn decode_joins_byte_fallback_pieces() {
+        let pieces = ["<ctrl>", "\u{2581}hi", "<0xF0>", "<0x9F>", "<0x91>", "<0x8D>", "<0xFF>"];
+        let mut types = vec![PieceType::Control, PieceType::Normal];
+        types.extend([PieceType::Byte; 5]);
+        let vocab = SpmVocab {
+            pieces: pieces.iter().map(|p| p.to_string()).collect(),
+            types,
+            scores: vec![0.0; 7],
+            by_piece: HashMap::new(),
+            eos_id: 0,
+            unk_id: 0,
+            max_piece_bytes: 8,
+            min_score: 0.0,
+            normalizer: Normalizer::from_spec(&[]),
+            byte_pieces: Box::new([None; 256]),
+        };
+        assert_eq!(vocab.decode(&[0, 1, 2, 3, 4, 5]), "hi👍");
+        assert_eq!(vocab.decode(&[1, 6]), "hi\u{FFFD}"); // invalid byte -> replacement char
+    }
+
+    #[test]
+    fn decode_with_offsets_keeps_byte_pieces_literal() {
+        // `decode_with_offsets` deliberately does NOT fold byte pieces into their
+        // raw byte (unlike `decode`): a single id would then cover a partial UTF-8
+        // char and its `Range` could land mid-character. Pin that divergence here so
+        // it reads as intentional, not as a decode bug to "fix".
+        let vocab = SpmVocab {
+            pieces: ["\u{2581}hi", "<0xF0>"].iter().map(|p| p.to_string()).collect(),
+            types: vec![PieceType::Normal, PieceType::Byte],
+            scores: vec![0.0; 2],
+            by_piece: HashMap::new(),
+            eos_id: 0,
+            unk_id: 0,
+            max_piece_bytes: 8,
+            min_score: 0.0,
+            normalizer: Normalizer::from_spec(&[]),
+            byte_pieces: Box::new([None; 256]),
+        };
+        let ids = [0u32, 1]; // ▁hi <0xF0>
+        assert_eq!(vocab.decode(&ids), "hi\u{FFFD}");
+        assert_eq!(vocab.decode_with_offsets(&ids).0, "hi<0xF0>");
+        assert_ne!(vocab.decode_with_offsets(&ids).0, vocab.decode(&ids));
     }
 
     #[test]
