@@ -26,6 +26,9 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#if defined(_MSC_VER)
+#include <malloc.h>  // MSVC: _aligned_malloc/_aligned_free (no std::aligned_alloc)
+#endif
 
 #ifdef FXT_GEMM_THREADS
 // Intra-op GEMM parallelism (feature `gemm-threads`): a persistent thread pool
@@ -70,13 +73,24 @@ constexpr size_t kRegElems = xsimd::batch<int8_t, Arch>::size;
 
 inline size_t round_up(size_t x, size_t m) { return (x + m - 1) / m * m; }
 
-// Aligned allocation sized for SIMD stores. std::aligned_alloc requires the
-// size to be a multiple of the alignment, so round it up; never return null for
-// a zero request.
+// Aligned allocation sized for SIMD stores. The size is rounded up to the
+// alignment (C11 `aligned_alloc` requires that); never return null for a zero
+// request. MSVC's `<cstdlib>` has no `std::aligned_alloc`, and its
+// `_aligned_malloc` memory must be released with `_aligned_free`, so both the
+// allocator and the free are paired here.
+#if defined(_MSC_VER)
+inline void *aligned(size_t bytes) {
+  size_t n = round_up(bytes ? bytes : 1, 64);
+  return _aligned_malloc(n, 64);
+}
+inline void aligned_free(void *p) { _aligned_free(p); }
+#else
 inline void *aligned(size_t bytes) {
   size_t n = round_up(bytes ? bytes : 1, 64);
   return std::aligned_alloc(64, n);
 }
+inline void aligned_free(void *p) { std::free(p); }
+#endif
 
 struct PreparedB {
   int8_t *data;  // register-blocked, 16-byte aligned; logically [n_pad, k]
@@ -226,7 +240,7 @@ void *gemmology_prepare_b(const int8_t *b_transposed, size_t n, size_t k) {
   int8_t *packed = static_cast<int8_t *>(aligned(n_pad * k));
   gemmology::PrepareBQuantizedTransposed<Arch>(src, packed, /*cols=*/k,
                                                /*rows=*/n_pad);
-  std::free(src);
+  aligned_free(src);
 
   g_prepared_bytes.fetch_add(n_pad * k, std::memory_order_relaxed);
   return new PreparedB{packed, n, n_pad, k};
@@ -236,7 +250,7 @@ void gemmology_free_b(void *handle) {
   if (!handle) return;
   PreparedB *h = static_cast<PreparedB *>(handle);
   g_prepared_bytes.fetch_sub(h->n_pad * h->k, std::memory_order_relaxed);
-  std::free(h->data);
+  aligned_free(h->data);
   delete h;
 }
 
@@ -324,9 +338,9 @@ void gemmology_multiply(void *handle, const uint8_t *a, size_t m, float unquant,
   for (size_t r = 0; r < m; ++r)
     std::memcpy(out + r * n, out_al + r * n_pad, n * sizeof(float));
 
-  std::free(a_al);
-  std::free(bias_al);
-  std::free(out_al);
+  aligned_free(a_al);
+  aligned_free(bias_al);
+  aligned_free(out_al);
 }
 
 }  // extern "C"
